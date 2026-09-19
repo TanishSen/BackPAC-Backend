@@ -26,8 +26,24 @@ from app.shared.errors_handlers import register_exception_handlers
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """One httpx client for the whole process (used to call the agent), opened
-    at startup and closed at shutdown — not one connection per request."""
+    """Everything that must exist before the first request, and be cleaned up
+    after the last one.
+
+    Two things live here:
+
+    - **The database.** `init_database` creates any missing tables and reports
+      whether the DB is usable. It deliberately does NOT raise: a voice call
+      and trip search touch no tables, so an unreachable database must not stop
+      the API from serving them. Only saved-trip routes 503, with a clear
+      message. See db/session.py.
+
+    - **One httpx client for the whole process**, used to call the agent — so
+      we reuse a single connection pool instead of opening one per request.
+    """
+    from app.db.session import init_database
+
+    app.state.db_ready = await init_database()
+
     async with httpx.AsyncClient() as client:
         app.state.http_client = client
         yield
