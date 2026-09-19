@@ -32,9 +32,16 @@ for every endpoint below. That is the fastest way to see and test them.
 
 | Key | What it's for | Needed for |
 |---|---|---|
-| `DATABASE_URL` | Postgres connection | saved-trips endpoints |
-| `LIVEKIT_URL/_API_KEY/_API_SECRET` | mint voice rooms (free tier at livekit.io) | `POST /sessions` |
+| `DATABASE_URL` | the database. Defaults to SQLite, so it runs with no infrastructure; point it at Postgres for anything shared. | saved-trips endpoints |
+| `LIVEKIT_URL/_API_KEY/_API_SECRET` | mint voice rooms (free tier at livekit.io). **Must match `BackPAC-Agent/.env` exactly.** | `POST /sessions` |
 | `AGENT_BASE_URL` | where BackPAC-Agent runs | `POST /sessions` |
+
+**A missing database does not stop the API.** Starting a voice call and
+searching for trips touch no tables at all, so if the database is unreachable
+the service logs a warning and carries on serving them; only the saved-trip
+routes return 503. `GET /readyz` tells you which state you are in. That
+deliberate choice is in `db/session.py` — a demo should not die because nobody
+started Postgres.
 
 The Anthropic and ElevenLabs keys are **not** here — those live in the *agent*,
 not the backend. This service never calls Claude directly.
@@ -50,7 +57,7 @@ Base path for everything except health is `/api/v1`.
 | Method | Path | Does |
 |---|---|---|
 | GET | `/healthz` | "Is the process alive?" Returns `{"status":"ok"}`. For load balancers. |
-| GET | `/readyz` | "Is it configured?" Also reports whether LiveKit keys are set — check this first when sessions won't start. |
+| GET | `/readyz` | "Is it configured?" Reports `livekit_configured` and `database_ready` — check this first when anything won't start. It touches no upstream, because a health check that fans out is a health check that flaps. |
 
 ### Sessions — starting a voice call
 
@@ -85,6 +92,34 @@ shape identical and nothing else has to change.
 > you change a field name, tell whoever owns the agent — their tool in
 > `BackPAC-Agent/src/bot/core/tools.py` sends this exact shape.
 
+### Voice — what the orb says
+
+Three routes, all proxies: the agent synthesises, because that is where the
+ElevenLabs key lives, and these exist so the app still only ever talks to one
+host. **None of them is a call** — no LiveKit room, no session, no microphone
+permission. The welcome screen should not need any of that to say hello.
+
+| Method | Path | Does |
+|---|---|---|
+| GET | `/api/v1/voice/greeting` (optional `?text=`) | One opening line. |
+| GET | `/api/v1/voice/welcome-lines` | Every line the orb might say: the opener, what it says when poked, what it says when you leave it alone. |
+| GET | `/api/v1/voice/line.wav?text=…` | The audio for one line. |
+
+The JSON carries `{ "text", "levels": [0..1], "frameMs": 50 }` — `levels` is one
+loudness value per frame, so the app drives the orb's mouth from the actual
+waveform rather than a generic wobble. A few hundred bytes, so it travels
+inline.
+
+**The audio does not travel inline.** Base64 in the JSON made
+`welcome-lines` a 2.5 MB body that no cache could reuse; as separate files it
+is 5.7 KB of JSON plus ~65 KB per line, fetched once and then served from the
+browser's cache (the responses are `immutable` — the text fully determines the
+audio).
+
+Every line is cached agent-side, so a cold `welcome-lines` costs one synthesis
+per line (~5s for all nineteen, done in parallel) and every request after that
+is ~20ms. The app fetches it in the background, so neither case is on screen.
+
 ### Trips — saved (the database example)
 
 These two exist to show the full router→service→repository→DB path end to end.
@@ -102,10 +137,10 @@ Read them when you build any DB-backed feature.
 1. **Real search providers.** Replace the three mock methods in
    `trips/service.py`. This is the actual product — an agent that can't really
    search is a demo. Everything else already works around it.
-2. **Create the database tables.** The `saved_trips` model exists but no table
-   is created yet. Simplest for now: add a one-off startup step that runs
-   `Base.metadata.create_all`. Proper answer later: Alembic migrations. Ask if
-   you want the startup snippet.
+2. **Migrations.** Tables are created at startup with
+   `Base.metadata.create_all` (`db/session.py`). That is fine while the schema
+   is disposable, but it cannot *change* a table that already exists. Move to
+   Alembic before this database holds anything anyone would miss.
 3. **Auth.** Every endpoint is open right now. When you add login, sessions and
    saved-trips should require it. `user_ref` becomes the logged-in user.
 
