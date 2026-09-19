@@ -8,7 +8,9 @@ from fastapi import APIRouter
 
 from app.domains.sessions.router import router as sessions_router
 from app.domains.trips.router import router as trips_router
+from app.domains.voice.router import router as voice_router
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(sessions_router)
 api_router.include_router(trips_router)
+api_router.include_router(voice_router)
