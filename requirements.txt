@@ -5,6 +5,8 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
+# SQLite driver — the zero-infrastructure local default for DATABASE_URL.
+aiosqlite==0.22.1
 httpx==0.28.1
 livekit-api==0.8.2
 python-dotenv==1.0.1
