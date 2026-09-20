@@ -40,9 +40,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     - **One httpx client for the whole process**, used to call the agent — so
       we reuse a single connection pool instead of opening one per request.
     """
-    from app.db.session import init_database
+    from app.db.session import init_database, warm_pool
+    from app.shared.auth import warm_jwks
 
     app.state.db_ready = await init_database()
+
+    # Pay the cold-start costs here rather than on whoever asks first.
+    #
+    # The database lives in another region and the signing keys come from
+    # Supabase over the network, so the first authenticated request used to
+    # carry a TLS handshake to Singapore *and* a key fetch on top of its own
+    # work — over twenty seconds on a cold process, which the app read as the
+    # server being unreachable and reported as such while it was still coming.
+    #
+    # Both are gathered rather than awaited in turn: they are independent, and
+    # startup should not be the sum of two round trips when it can be the
+    # longer of them.
+    import asyncio
+
+    await asyncio.gather(
+        warm_pool(),
+        warm_jwks(get_settings()),
+    )
 
     async with httpx.AsyncClient() as client:
         app.state.http_client = client

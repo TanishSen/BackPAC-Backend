@@ -33,6 +33,54 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://backpac:backpac@localhost:5432/backpac"
     )
 
+    # --- Supabase (identity) -----------------------------------------------
+    # The app signs users in with Supabase Auth and sends the resulting JWT as
+    # `Authorization: Bearer <token>`. This API verifies it against Supabase's
+    # published signing keys (JWKS) — those are public, so no Supabase secret
+    # is needed here. The service-role key is deliberately NOT a setting: this
+    # API talks to Postgres directly and never needs to impersonate anyone.
+    supabase_project_ref: str = ""
+
+    @property
+    def supabase_jwks_url(self) -> str:
+        return (
+            f"https://{self.supabase_project_ref}.supabase.co"
+            "/auth/v1/.well-known/jwks.json"
+        )
+
+    @property
+    def supabase_issuer(self) -> str:
+        return f"https://{self.supabase_project_ref}.supabase.co/auth/v1"
+
+    @property
+    def auth_configured(self) -> bool:
+        return bool(self.supabase_project_ref)
+
+    # --- agent -> API service auth -----------------------------------------
+    # The agent writes the transcript as it speaks, but it holds no user token:
+    # it is a server, not a signed-in person. It authenticates to the internal
+    # message-logging route with this shared secret instead. Must match
+    # BACKEND_SERVICE_TOKEN in the agent's environment. Empty means the
+    # internal routes are disabled outright rather than left open.
+    service_token: str = ""
+
+    # --- flight search (Travelpayouts / Aviasales) -------------------------
+    # A free affiliate API. The token authenticates us; the marker is what
+    # turns a booking click into commission, so a deployment with a token and
+    # no marker works and earns nothing.
+    travelpayouts_token: str = ""
+    travelpayouts_marker: str = ""
+
+    @property
+    def flights_live(self) -> bool:
+        """True when real flight search is configured.
+
+        Without it the API serves clearly-labelled sample flights rather than
+        failing, so the app and the agent stay usable on a laptop with no
+        keys — but nothing pretends the numbers are real.
+        """
+        return bool(self.travelpayouts_token)
+
     # --- LiveKit (the voice room the phone and the agent both join) --------
     # LiveKit is a hosted service (livekit.io free tier) or a self-hosted
     # server. This backend only needs the credentials to MINT a room + token;

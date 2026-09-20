@@ -40,9 +40,28 @@ class TransitOption(BaseModel):
     provider: str  # e.g. "IRCTC", "IndiGo"
     name: str  # "Shatabdi Express", "6E-2043"
     depart: str  # ISO time string
-    arrive: str
+    arrive: str  # may be empty when the provider gives no arrival time
     duration_minutes: int = Field(alias="durationMinutes")
     price_inr: int = Field(alias="priceInr")
+
+    #: 0 for non-stop. Worth saying out loud — a cheap two-stop is not the
+    #: same offer as a slightly dearer direct, and only one of them is a
+    #: good morning.
+    stops: int = 0
+
+    #: Where to actually book this, carrying our affiliate marker. Empty when
+    #: the provider has no link — mock data, for instance.
+    booking_url: str = Field(default="", alias="bookingUrl")
+
+    #: True when the price is a cached estimate rather than a live quote.
+    #:
+    #: Not decoration: it changes what the agent is allowed to say. Cached
+    #: metasearch data supports "around ₹21,000"; it does not support
+    #: "₹21,229", and stating a stale number as fact is how an app gets
+    #: caught out at the payment page.
+    price_is_approximate: bool = Field(
+        default=False, alias="priceIsApproximate"
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 

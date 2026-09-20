@@ -7,6 +7,18 @@ sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
 # SQLite driver — the zero-infrastructure local default for DATABASE_URL.
 aiosqlite==0.22.1
+# Schema migrations. Replaces create_all — see migrations/env.py.
+alembic==1.14.0
+# Verifies Supabase access tokens against the project's published JWKS.
+# The [crypto] extra brings the ES256 support those keys need.
+pyjwt[crypto]==2.10.1
 httpx==0.28.1
 livekit-api==0.8.2
 python-dotenv==1.0.1
+
+# --- tests -------------------------------------------------------------
+pytest==9.1.1
+pytest-asyncio==1.4.0
+# Stubs httpx at the transport layer, so provider tests never touch the
+# network or spend the flight API's 200/hour budget.
+respx==0.23.1

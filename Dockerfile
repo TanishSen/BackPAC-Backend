@@ -27,4 +27,8 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Migrations run on the way up — see entrypoint.sh. With more than one
+# replica, run `alembic upgrade head` as a separate release step instead and
+# drop this back to the uvicorn line: Alembic takes a lock, so concurrent
+# replicas are safe but serialised, and one slow migration delays every boot.
+CMD ["./entrypoint.sh"]

@@ -15,8 +15,13 @@ The search methods take no DB session because they hit external providers, not
 our database. That is normal: a service composes whatever a use case needs.
 """
 
+import logging
 from datetime import datetime, timedelta
 
+from app.core.config import get_settings
+from app.domains.trips.providers.base import FlightProvider, ProviderError
+from app.domains.trips.providers.mock import MockFlights
+from app.domains.trips.providers.travelpayouts import TravelpayoutsFlights
 from app.domains.trips.repository import TripRepository
 from app.domains.trips.schemas import (
     SaveTripRequest,
@@ -27,8 +32,39 @@ from app.domains.trips.schemas import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+def _default_flight_provider() -> FlightProvider:
+    """The real provider when configured, sample data otherwise.
+
+    Chosen once at construction rather than per request, so a deployment
+    cannot silently drift between real and sample answers.
+    """
+    settings = get_settings()
+    if settings.flights_live:
+        return TravelpayoutsFlights(
+            token=settings.travelpayouts_token,
+            marker=settings.travelpayouts_marker,
+        )
+    logger.warning(
+        "no TRAVELPAYOUTS_TOKEN — serving sample flights, clearly labelled"
+    )
+    return MockFlights()
+
+
 class TripService:
-    # --- search: MOCK for now, real providers later --------------------
+    """Composes a search out of whichever provider is configured.
+
+    The provider is injected rather than constructed here, so the service has
+    no opinion about which company answers and tests can pass a fake. See
+    `providers/` and `deps.py`.
+    """
+
+    def __init__(self, flights: FlightProvider | None = None):
+        self._flights = flights or _default_flight_provider()
+
+    # --- search --------------------------------------------------------
     async def search_trains(self, q: TransitSearch) -> list[TransitOption]:
         # TODO(backend): replace with the real train provider (IRCTC/RapidAPI).
         # Keep the return type; the agent and app depend on this shape.
@@ -53,18 +89,41 @@ class TripService:
         ]
 
     async def search_flights(self, q: TransitSearch) -> list[TransitOption]:
-        # TODO(backend): real flight provider.
-        base = datetime.combine(q.depart_date, datetime.min.time()).replace(hour=9)
-        return [
-            TransitOption(
-                provider="IndiGo",
-                name="6E-2043",
-                depart=base.isoformat(),
-                arrive=(base + timedelta(hours=1, minutes=10)).isoformat(),
-                durationMinutes=70,
-                priceInr=4200,
-            ),
-        ]
+        """Flights for this route, around this date. May legitimately be empty.
+
+        A provider failure becomes an empty list rather than an exception, and
+        is logged loudly. The reasoning: the agent is mid-conversation with a
+        person, and "I could not find flights just now" is a recoverable turn,
+        while a 502 ends the call. The log is where an operator finds out;
+        the caller is not the right place to raise an alarm.
+        """
+        try:
+            options = await self._flights.search_flights(q)
+        except ProviderError as exc:
+            logger.warning(
+                "flight search failed via %s (%s -> %s): %s",
+                getattr(self._flights, "name", "?"),
+                q.origin,
+                q.destination,
+                exc,
+            )
+            return []
+        except Exception:  # noqa: BLE001 — a provider must not end a call
+            logger.exception(
+                "flight provider %s raised unexpectedly",
+                getattr(self._flights, "name", "?"),
+            )
+            return []
+
+        logger.info(
+            "flights %s -> %s on %s: %d option(s) via %s",
+            q.origin,
+            q.destination,
+            q.depart_date,
+            len(options),
+            getattr(self._flights, "name", "?"),
+        )
+        return options
 
     async def search_stays(self, q: StaySearch) -> list[StayOption]:
         # TODO(backend): real hotel provider.

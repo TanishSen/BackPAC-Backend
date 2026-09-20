@@ -20,6 +20,7 @@ Two rules this module exists to enforce:
 import logging
 from collections.abc import AsyncIterator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -36,10 +37,50 @@ _settings = get_settings()
 # Creating the engine opens no connection — it just parses the URL and picks a
 # driver. A wrong host fails later, at first use, which is what lets the app
 # boot without a database running.
+def _connect_args() -> dict:
+    """Driver options that depend on where the database actually is.
+
+    Supabase is reached through a connection pooler, and a pooler hands the
+    same backend connection to different clients over time. asyncpg's prepared
+    statement cache assumes the opposite — that a statement it prepared is
+    still there next time — so against a pooler it eventually raises
+    DuplicatePreparedStatementError under load. Turning the cache off is the
+    supported fix and costs a re-parse per query, which is nothing next to the
+    round trip to Singapore.
+
+    SQLite takes none of this, hence the check rather than an unconditional
+    dict: passing asyncpg options to aiosqlite is an immediate TypeError.
+    """
+    if _settings.database_url.startswith("postgresql"):
+        return {"statement_cache_size": 0}
+    return {}
+
+
+# Creating the engine opens no connection — it just parses the URL and picks a
+# driver. A wrong host fails later, at first use, which is what lets the app
+# boot without a database running.
 engine = create_async_engine(
     _settings.database_url,
     pool_pre_ping=True,  # drop dead connections instead of erroring on them
     future=True,
+    connect_args=_connect_args(),
+    # Sized deliberately, because the ceiling is not ours.
+    #
+    # SQLAlchemy defaults to pool_size=5 with max_overflow=10, so one process
+    # will happily open 15 connections. Supabase's pooler allows 15 clients in
+    # total on the free plan — for everything, including the agent's
+    # checkpointer pool and whatever psql you have open. The default therefore
+    # exhausts the quota on its own under load and fails with EMAXCONNSESSION,
+    # which reads like a database outage rather than a config mistake.
+    #
+    # These numbers are for one API container against a free project. Raise
+    # them together with the plan, not ahead of it.
+    pool_size=5,
+    max_overflow=2,
+    pool_timeout=20,
+    # Recycle before the pooler decides an idle connection is stale, so a quiet
+    # night is not followed by a burst of errors in the morning.
+    pool_recycle=900,
 )
 
 SessionFactory = async_sessionmaker(
@@ -59,20 +100,19 @@ def is_db_ready() -> bool:
 
 
 async def init_database() -> bool:
-    """Create any missing tables. Returns whether the database is usable.
+    """Check the database is reachable. Returns whether it is usable.
 
-    Importing the models is what registers them on `Base.metadata`, so
-    `create_all` knows the tables exist to be made. Fine for now; swap for
-    Alembic migrations before this schema has data anyone would miss.
+    It does NOT create tables. Schema is Alembic's job now (`alembic upgrade
+    head`), because `create_all` only ever creates what is missing — it cannot
+    alter a column, so the first change to a live table would be silently
+    ignored here and discovered in production. A table that has not been
+    migrated shows up as a clear error on the route that needs it.
     """
     global _db_ready
 
-    from app.db.base import Base
-    from app.domains.trips import models as _trip_models  # noqa: F401 (registers tables)
-
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001 — a dead DB is not a reason to not boot
         _db_ready = False
         logger.warning(
@@ -87,6 +127,29 @@ async def init_database() -> bool:
     _db_ready = True
     logger.info("database ready (%s)", _settings.database_url.split("://", 1)[0])
     return True
+
+
+async def warm_pool() -> None:
+    """Open the pool's first connections before anyone needs them.
+
+    Connecting to Postgres is not cheap when it is in another region: DNS, a
+    TCP handshake, TLS, then authentication — and `pool_pre_ping` adds a round
+    trip on top when the connection is checked out. Doing that inside the
+    first real request made it several seconds slower than every request after
+    it, for no reason other than arriving first.
+
+    Two connections, not the whole pool: enough that the first couple of
+    requests are fast, without making startup wait on five handshakes.
+    """
+    if not _db_ready:
+        return
+    try:
+        async with engine.connect() as a, engine.connect() as b:
+            await a.execute(text("SELECT 1"))
+            await b.execute(text("SELECT 1"))
+        logger.info("database pool warmed")
+    except Exception as exc:  # noqa: BLE001 — an optimisation, not a dependency
+        logger.warning("could not warm the database pool: %s", exc)
 
 
 async def get_db_session() -> AsyncIterator[AsyncSession]:
