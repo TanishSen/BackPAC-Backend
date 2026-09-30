@@ -10,7 +10,7 @@ caching, or swap Postgres for something else, it changes here and nowhere else.
 
 from collections.abc import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.trips.models import SavedTrip
@@ -41,3 +41,21 @@ class TripRepository:
             .order_by(SavedTrip.created_at.desc())
         )
         return result.scalars().all()
+
+    async def delete_saved_trip(self, *, trip_id: int, user_ref: str) -> bool:
+        """Scoped by owner as well as id, so a guessed id deletes nothing."""
+        result = await self._db.execute(
+            delete(SavedTrip).where(
+                SavedTrip.id == trip_id, SavedTrip.user_ref == user_ref
+            )
+        )
+        await self._db.commit()
+        return result.rowcount > 0
+
+    async def delete_all_for_user(self, *, user_ref: str) -> int:
+        """Every saved trip this user has. Account deletion calls this; it does
+        not commit, so it lands in the same transaction as the sessions."""
+        result = await self._db.execute(
+            delete(SavedTrip).where(SavedTrip.user_ref == user_ref)
+        )
+        return result.rowcount

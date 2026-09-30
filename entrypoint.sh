@@ -13,5 +13,14 @@ set -e
 echo "==> alembic upgrade head"
 alembic upgrade head
 
-echo "==> starting API"
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+# $PORT because Render, Railway, Fly and Cloud Run all assign one. The proxy
+# flags make request.client the real caller rather than the load balancer —
+# the per-IP rate limits depend on it. Only trust them behind a proxy you run.
+echo "==> starting API on :${PORT:-8000}"
+exec uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port "${PORT:-8000}" \
+    --proxy-headers \
+    --forwarded-allow-ips="${FORWARDED_ALLOW_IPS:-*}" \
+    --timeout-graceful-shutdown 20 \
+    --no-server-header

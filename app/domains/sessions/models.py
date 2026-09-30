@@ -31,6 +31,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -92,8 +93,27 @@ class Session(Base):
         Boolean, default=False, server_default="false"
     )
 
-    #: 'active' while it may still be resumed, 'archived' once the user has put
-    #: it away. There is no 'deleted': a delete is a delete. See the repository.
+    #: Hearted by the user, from the history list. Another axis again, not a
+    #: synonym for `saved`: "saved" is "keep this to come back to", a
+    #: favourite is "I loved this one" — the profile counts them separately.
+    favourite: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+
+    #: The user's own folder for this conversation ("Mountains", "Honeymoon"),
+    #: or null. One group per conversation, like a folder: nulled rather than
+    #: deleted with it when the group goes, because deleting a folder should
+    #: not delete what was in it.
+    group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("session_groups.id", ondelete="SET NULL"),
+        default=None,
+        index=True,
+    )
+
+    #: 'active' while it is still being planned, 'completed' once the user
+    #: says they took the trip, 'archived' once they have put it away. All
+    #: three can be resumed. There is no 'deleted': a delete is a delete.
     status: Mapped[str] = mapped_column(String(16), default="active")
 
     created_at: Mapped[datetime] = mapped_column(
@@ -204,3 +224,24 @@ class TripResult(Base):
     )
 
     session: Mapped[Session] = relationship(back_populates="trip_results")
+
+
+class SessionGroup(Base):
+    """A folder of conversations, named by the user — "Mountains", "Desert"."""
+
+    __tablename__ = "session_groups"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    #: Owner, the JWT's `sub`. Scoped in the repository like everything else.
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    name: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        # Two folders both called "Mountains" is always a mistake.
+        UniqueConstraint("user_id", "name", name="uq_session_groups_user_name"),
+    )

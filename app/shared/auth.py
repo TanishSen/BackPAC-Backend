@@ -123,6 +123,12 @@ async def current_user(
         # 500 and tells the caller the server broke rather than their token.
         logger.warning("no signing key for presented token: %s", exc)
         raise _unauthorized("That access token is not valid.") from None
+    except jwt.InvalidTokenError as exc:
+        # Not a JWT at all — garbage, truncated, or a different kind of token.
+        # Finding the key means parsing the header first, and that raises
+        # DecodeError before any signature is checked; uncaught it was a 500.
+        logger.warning("rejected a malformed token: %s", exc)
+        raise _unauthorized("That access token is not valid.") from None
 
     try:
         claims = jwt.decode(
@@ -171,13 +177,47 @@ async def require_service(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Internal routes are disabled (SERVICE_TOKEN is unset).",
         )
-    if not x_service_token or not hmac.compare_digest(
-        x_service_token, settings.service_token
-    ):
+    if not service_token_valid(x_service_token, settings):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Bad or missing X-Service-Token.",
         )
+
+
+def service_token_valid(presented: str | None, settings: Settings) -> bool:
+    """Whether `presented` is this deployment's service token. Constant time."""
+    return bool(
+        settings.service_token
+        and presented
+        and hmac.compare_digest(presented, settings.service_token)
+    )
+
+
+async def user_or_service(
+    x_service_token: str | None = Header(default=None),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    settings: Settings = Depends(get_settings),
+) -> str:
+    """Gate for routes both the agent and a signed-in person may call.
+
+    Trip search is the case: the agent searches mid-call on the user's behalf,
+    and the app may one day search directly. Either key works; neither is
+    optional. Returns a stable caller key — "service" or "user:<id>" — which is
+    what the rate limiter counts against.
+
+    A service token that is present but wrong is a 401 rather than a fall
+    through to the JWT: a caller that thinks it is the agent and is not should
+    hear about it, not be told to sign in.
+    """
+    if x_service_token is not None:
+        if service_token_valid(x_service_token, settings):
+            return "service"
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Bad X-Service-Token.",
+        )
+    user_id = await current_user(credentials=credentials, settings=settings)
+    return f"user:{user_id}"
 
 
 async def warm_jwks(settings: Settings) -> None:

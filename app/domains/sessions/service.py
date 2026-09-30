@@ -27,7 +27,10 @@ from app.core.config import Settings
 from app.domains.sessions.clients.agent import AgentClient
 from app.domains.sessions.clients.livekit import LiveKitClient
 from app.domains.sessions.repository import SessionRepository
+from app.domains.trips.repository import TripRepository
 from app.domains.sessions.schemas import (
+    GroupIn,
+    GroupOut,
     LiveKitTransport,
     MessageOut,
     SessionCreate,
@@ -37,7 +40,10 @@ from app.domains.sessions.schemas import (
     SessionSummary,
     SessionUpdate,
 )
-from app.shared.exceptions import NotFoundError
+from app.shared.exceptions import BadRequestError, NotFoundError
+
+#: More folders than anyone organises by hand; fewer than a script makes.
+MAX_GROUPS = 50
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +60,7 @@ class SessionService:
     ):
         self._livekit = LiveKitClient(settings)
         self._agent = AgentClient(http, settings)
+        self._http = http
         self._settings = settings
         self._repo = SessionRepository(db)
         self._db = db
@@ -85,6 +92,14 @@ class SessionService:
             ]
         else:
             is_resuming = False
+            # A new plan is what the free allowance counts; resuming never is.
+            # Imported here: billing reads this domain's repository, and a
+            # module-level import would make the two import each other.
+            from app.domains.billing.service import PlanService
+
+            await PlanService(self._db, self._settings, self._http).assert_can_start(
+                user_id
+            )
             room_name = f"backpac-{uuid.uuid4().hex[:16]}"
             session = await self._repo.create(
                 user_id=user_id, room_name=room_name, agent_id=body.agent_id
@@ -115,14 +130,18 @@ class SessionService:
         #
         # What carries the conversation across calls is the room name, which is
         # also the LangGraph thread — not this.
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
         await self._agent.start(
             room_name=session.room_name,
-            session_id=f"run_{uuid.uuid4().hex[:12]}",
+            session_id=run_id,
             agent_id=session.agent_id,
             thread_id=session.room_name,
             is_resuming=is_resuming,
         )
 
+        # Remembered so hanging up can stop exactly this bot (see
+        # `end_session`), and a resumed call is open again until it ends.
+        await self._repo.mark_started(session_id=session.id, run_id=run_id)
         await self._db.commit()
 
         logger.info(
@@ -156,6 +175,9 @@ class SessionService:
         offset: int,
         status: str | None,
         saved: bool | None = None,
+        favourite: bool | None = None,
+        group_id: uuid.UUID | None = None,
+        mode: str | None = None,
     ) -> SessionList:
         """A page of this user's history.
 
@@ -169,6 +191,9 @@ class SessionService:
             offset=offset,
             status=status,
             saved=saved,
+            favourite=favourite,
+            group_id=group_id,
+            mode=mode,
         )
         has_more = len(rows) > limit
         return SessionList(
@@ -219,10 +244,94 @@ class SessionService:
                 )
                 or touched
             )
+        if body.favourite is not None:
+            touched = (
+                await self._repo.set_favourite(
+                    session_id=session_id, user_id=user_id, favourite=body.favourite
+                )
+                or touched
+            )
+        if "group_id" in body.model_fields_set:
+            if body.group_id is not None and not await self._repo.get_group(
+                group_id=body.group_id, user_id=user_id
+            ):
+                # Someone else's group id is indistinguishable from no group.
+                raise NotFoundError("That group could not be found.")
+            touched = (
+                await self._repo.set_group(
+                    session_id=session_id, user_id=user_id, group_id=body.group_id
+                )
+                or touched
+            )
         if not touched:
             raise NotFoundError("That conversation could not be found.")
         await self._db.commit()
         return await self.get_session(session_id=session_id, user_id=user_id)
+
+    async def end_session(
+        self, *, session_id: uuid.UUID, user_id: uuid.UUID
+    ) -> SessionSummary:
+        """The app hung up: mark the call ended and release its bot now.
+
+        Idempotent — ending an ended call changes nothing and still succeeds,
+        because the app may retry on a flaky connection. Stopping the bot is
+        best effort: the agent also notices the caller leaving the room.
+        """
+        session = await self._repo.get(session_id=session_id, user_id=user_id)
+        if session is None:
+            raise NotFoundError("That conversation could not be found.")
+        if session.ended_at is None:
+            await self._repo.end(session_id=session_id, user_id=user_id)
+            await self._db.commit()
+            await self._db.refresh(session)
+        run_id = (session.meta or {}).get("agent_run_id")
+        if run_id:
+            await self._agent.stop(session_id=run_id)
+        return SessionSummary.model_validate(session)
+
+    # --- groups -------------------------------------------------------------
+
+    async def list_groups(self, *, user_id: uuid.UUID) -> list[GroupOut]:
+        return [
+            GroupOut(id=g.id, name=g.name, count=n, created_at=g.created_at)
+            for g, n in await self._repo.list_groups(user_id=user_id)
+        ]
+
+    async def create_group(self, *, user_id: uuid.UUID, body: GroupIn) -> GroupOut:
+        name = " ".join(body.name.split())
+        if not name:
+            raise BadRequestError("Give the group a name.")
+        if await self._repo.find_group_by_name(name=name, user_id=user_id):
+            raise BadRequestError(f"You already have a group called {name}.")
+        if await self._repo.count_groups(user_id=user_id) >= MAX_GROUPS:
+            raise BadRequestError(f"You can have up to {MAX_GROUPS} groups.")
+        group = await self._repo.create_group(user_id=user_id, name=name)
+        await self._db.commit()
+        return GroupOut(id=group.id, name=group.name, count=0, created_at=group.created_at)
+
+    async def rename_group(
+        self, *, group_id: uuid.UUID, user_id: uuid.UUID, body: GroupIn
+    ) -> GroupOut:
+        name = " ".join(body.name.split())
+        if not name:
+            raise BadRequestError("Give the group a name.")
+        clash = await self._repo.find_group_by_name(name=name, user_id=user_id)
+        if clash is not None and clash.id != group_id:
+            raise BadRequestError(f"You already have a group called {name}.")
+        if not await self._repo.rename_group(
+            group_id=group_id, user_id=user_id, name=name
+        ):
+            raise NotFoundError("That group could not be found.")
+        await self._db.commit()
+        for group in await self.list_groups(user_id=user_id):
+            if group.id == group_id:
+                return group
+        raise NotFoundError("That group could not be found.")
+
+    async def delete_group(self, *, group_id: uuid.UUID, user_id: uuid.UUID) -> None:
+        if not await self._repo.delete_group(group_id=group_id, user_id=user_id):
+            raise NotFoundError("That group could not be found.")
+        await self._db.commit()
 
     async def delete_session(
         self, *, session_id: uuid.UUID, user_id: uuid.UUID
@@ -244,8 +353,18 @@ class SessionService:
         ours.
         """
         count = await self._repo.delete_all_for_user(user_id=user_id)
+        # Saved trips are theirs too, and an erasure that leaves some of what
+        # we hold behind is not one. Same transaction: all or nothing.
+        trips = await TripRepository(self._db).delete_all_for_user(
+            user_ref=str(user_id)
+        )
         await self._db.commit()
-        logger.info("erased %d session(s) for user %s", count, user_id)
+        logger.info(
+            "erased %d session(s) and %d saved trip(s) for user %s",
+            count,
+            trips,
+            user_id,
+        )
         return count
 
     # --- written by the agent, not by a person ----------------------------
@@ -308,6 +427,20 @@ class SessionService:
         session.meta = {**session.meta, "title_source": "agent"}
         await self._db.commit()
         logger.info("session %s named %r by the agent", session.id, session.title)
+
+    async def agent_ended(self, *, room_name: str, run_id: str | None) -> None:
+        """The agent reports the call is over — the caller left, or it idled
+        out. Sets `ended_at` unless the app already did, or unless the report
+        is from a bot that a newer call has since replaced."""
+        session = await self._repo.session_for_agent(room_name=room_name)
+        if session is None or session.ended_at is not None:
+            return
+        current = (session.meta or {}).get("agent_run_id")
+        if run_id and current and run_id != current:
+            logger.info("ignoring end from replaced bot %s in %s", run_id, room_name)
+            return
+        await self._repo.end(session_id=session.id, user_id=session.user_id)
+        await self._db.commit()
 
     async def log_trip_result(
         self, *, room_name: str, result_type: str, payload: dict

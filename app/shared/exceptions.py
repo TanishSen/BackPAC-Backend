@@ -28,6 +28,14 @@ class BadRequestError(AppError):
     message = "Bad request."
 
 
+class PaymentRequiredError(AppError):
+    """The free plan's allowance is used up. The app answers with the upgrade
+    screen, so the message is written to be shown there."""
+
+    status_code = 402
+    message = "You've used this month's free trip plans."
+
+
 class UpstreamError(AppError):
     """A service we depend on (LiveKit, the agent) failed or is unreachable."""
 

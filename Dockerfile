@@ -25,7 +25,7 @@ EXPOSE 8000
 # /healthz answers without touching the database or any upstream, so this
 # reports "is the process alive", which is the only thing a restart can fix.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT','8000'), timeout=2).status==200 else 1)"
 
 # Migrations run on the way up — see entrypoint.sh. With more than one
 # replica, run `alembic upgrade head` as a separate release step instead and

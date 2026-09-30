@@ -72,11 +72,15 @@ def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level)
 
+    docs = settings.docs_enabled
     app = FastAPI(
         title="BackPAC Backend",
         description="Sessions (LiveKit broker) + trips (search & saved).",
-        version="0.1.0",
+        version="1.0.0",
         lifespan=lifespan,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
 
     app.add_middleware(

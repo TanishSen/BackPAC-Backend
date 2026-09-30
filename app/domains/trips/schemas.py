@@ -18,8 +18,8 @@ from pydantic import BaseModel, ConfigDict, Field
 class TransitSearch(BaseModel):
     """Shared by trains, flights and buses — same shape, different provider."""
 
-    origin: str = Field(examples=["Delhi"])
-    destination: str = Field(examples=["Jaipur"])
+    origin: str = Field(min_length=1, max_length=80, examples=["Delhi"])
+    destination: str = Field(min_length=1, max_length=80, examples=["Jaipur"])
     depart_date: date = Field(alias="departDate")
     passengers: int = Field(default=1, ge=1, le=9)
 
@@ -27,7 +27,7 @@ class TransitSearch(BaseModel):
 
 
 class StaySearch(BaseModel):
-    destination: str
+    destination: str = Field(min_length=1, max_length=80)
     check_in: date = Field(alias="checkIn")
     check_out: date = Field(alias="checkOut")
     guests: int = Field(default=2, ge=1, le=12)
@@ -77,10 +77,12 @@ class StayOption(BaseModel):
 
 # --- saved trips (the DB-backed example) -----------------------------------
 class SaveTripRequest(BaseModel):
-    user_ref: str = Field(alias="userRef")
-    title: str
-    destination: str
-    nights: int = Field(default=1, ge=1)
+    #: Ignored, and optional so older clients still validate. The owner is the
+    #: signed-in user from the token — see the router.
+    user_ref: str | None = Field(default=None, alias="userRef", max_length=64)
+    title: str = Field(min_length=1, max_length=200)
+    destination: str = Field(min_length=1, max_length=120)
+    nights: int = Field(default=1, ge=1, le=365)
 
     model_config = ConfigDict(populate_by_name=True)
 

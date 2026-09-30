@@ -20,3 +20,8 @@ def configure_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level.upper())
+
+    # httpx logs every request URL at INFO, query string included — and the
+    # flight provider's token has travelled in one. Warnings still come through.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)

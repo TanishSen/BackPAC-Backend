@@ -22,127 +22,146 @@ Copy the `trips` domain when you build a new one — it shows the full path.
 cp .env.example .env         # then fill in the values (see below)
 uv venv --python 3.12 .venv  # or: python3.12 -m venv .venv
 uv pip install -r requirements.txt
+alembic upgrade head         # the schema is Alembic's
 uvicorn app.main:app --reload --port 8000
 ```
+
+In a container, `entrypoint.sh` migrates and then serves on `$PORT`.
 
 Open **http://localhost:8000/docs** — FastAPI generates a live, clickable page
 for every endpoint below. That is the fastest way to see and test them.
 
 ## What goes in `.env`
 
-| Key | What it's for | Needed for |
+| Key | What it's for | Without it |
 |---|---|---|
-| `DATABASE_URL` | the database. Defaults to SQLite, so it runs with no infrastructure; point it at Postgres for anything shared. | saved-trips endpoints |
-| `LIVEKIT_URL/_API_KEY/_API_SECRET` | mint voice rooms (free tier at livekit.io). **Must match `BackPAC-Agent/.env` exactly.** | `POST /sessions` |
-| `AGENT_BASE_URL` | where BackPAC-Agent runs | `POST /sessions` |
+| `ENVIRONMENT` | `production` hides internal details from `/readyz`. | — |
+| `DATABASE_URL` | Supabase Postgres (`postgresql+asyncpg://…`). Migrations are Postgres-only. | history + saved trips 503 |
+| `SUPABASE_PROJECT_REF` | verifies the app's sign-in tokens against Supabase's public keys. | every signed-in route 503 |
+| `SUPABASE_SERVICE_ROLE_KEY` | closes the Supabase sign-in account on `DELETE /account`. Server-only secret. | deletion erases data, leaves the sign-in |
+| `LIVEKIT_URL/_API_KEY/_API_SECRET` | mint voice rooms. **Must match `BackPAC-Agent/.env` exactly.** | `POST /sessions` 503 |
+| `AGENT_BASE_URL` | where BackPAC-Agent runs. | `POST /sessions` 502 |
+| `SERVICE_TOKEN` | shared secret between this API and the agent, both directions. **Must equal the agent's `BACKEND_SERVICE_TOKEN`.** | no transcripts, no search |
+| `TRAVELPAYOUTS_TOKEN/_MARKER` | live flight prices + affiliate marker. | labelled sample flights |
+| `REVENUECAT_WEBHOOK_AUTH` | the Authorization value RevenueCat's webhook sends. | webhook 503; Premium still syncs via `REVENUECAT_SECRET_KEY` |
+| `REVENUECAT_SECRET_KEY` | v1 secret key: ask RevenueCat directly after a purchase. | webhook events applied as sent |
+| `PREMIUM_ENTITLEMENT_ID` | the RevenueCat entitlement (default `premium`). | — |
+| `FREE_MONTHLY_TRIP_PLANS` | new plans per month on the free plan. **0 = unlimited, no upgrade prompts.** | — |
+| `DOCS_ENABLED` | serve `/docs`. | — |
+| `SESSION_START_LIMIT` / `_WINDOW_SECONDS` | calls a user may start per window (default 10 / 600s). | — |
+| `SEARCH_LIMIT` / `_WINDOW_SECONDS` | searches per signed-in user (default 30 / 60s). The agent is exempt. | — |
+| `VOICE_LIMIT` / `_WINDOW_SECONDS` | welcome-line fetches per IP (default 600 / 60s). | — |
 
-**A missing database does not stop the API.** Starting a voice call and
-searching for trips touch no tables at all, so if the database is unreachable
-the service logs a warning and carries on serving them; only the saved-trip
-routes return 503. `GET /readyz` tells you which state you are in. That
-deliberate choice is in `db/session.py` — a demo should not die because nobody
-started Postgres.
+**A database that is down does not stop the API.** Voice sessions still need it
+(the row is where the transcript goes), but search and the welcome lines do
+not. If it was unreachable at boot, the next request that needs it retries the
+connection (at most every 10s), so a blip heals without a restart.
+`GET /readyz` says which state you are in.
 
-The Anthropic and ElevenLabs keys are **not** here — those live in the *agent*,
-not the backend. This service never calls Claude directly.
+The Anthropic, ElevenLabs and Azure keys are **not** here — they live in the
+agent. This service never calls Claude directly.
 
 ---
 
 ## The endpoints
 
-Base path for everything except health is `/api/v1`.
+Base path for everything except health is `/api/v1`. Errors are JSON:
+`{"error": "…"}` from the app's own errors, `{"detail": …}` from auth and
+validation. `429` carries `Retry-After`.
+
+**Auth column:** *user* = `Authorization: Bearer <Supabase access token>`;
+*service* = `X-Service-Token: <SERVICE_TOKEN>` (the agent); *public* = none.
 
 ### Health
 
-| Method | Path | Does |
-|---|---|---|
-| GET | `/healthz` | "Is the process alive?" Returns `{"status":"ok"}`. For load balancers. |
-| GET | `/readyz` | "Is it configured?" Reports `livekit_configured` and `database_ready` — check this first when anything won't start. It touches no upstream, because a health check that fans out is a health check that flaps. |
-
-### Sessions — starting a voice call
-
-**`POST /api/v1/sessions`**
-The one multi-step endpoint. It mints a LiveKit room, mints an access token
-scoped to that room, tells the agent to join the room, and returns the token to
-the app. By the time the app gets the response, the bot is already in the room.
-
-- **Send:** `{ "agentId": "trip-planner", "participantName": "Jasmin" }`
-- **Get:** `{ "sessionId", "agentId", "livekit": { "url", "token", "roomName" } }`
-- **Flutter then:** joins `livekit.url` with `livekit.token` using `livekit_client`.
-- **Already done** — no work needed unless you add session history (see below).
-
-### Trips — search (called by the agent's tools *and* the app)
-
-These three share the same idea: take a search, return options. **Right now they
-return mock data.** Your main job is to replace the mock body in
-`app/domains/trips/service.py` with a real provider call — keep the return
-shape identical and nothing else has to change.
-
-| Method | Path | Does | Your job |
+| Method | Path | Auth | Does |
 |---|---|---|---|
-| POST | `/api/v1/trips/search/trains` | Trains between two cities on a date. | Wire to IRCTC / RapidAPI. Replace `TripService.search_trains`. |
-| POST | `/api/v1/trips/search/flights` | Flights between two cities on a date. | Wire to a flight API. Replace `search_flights`. |
-| POST | `/api/v1/trips/search/stays` | Hotels in a city between two dates. | Wire to a hotel API. Replace `search_stays`. |
+| GET | `/healthz` | public | Process alive. For load balancers. |
+| GET | `/readyz` | public | What is configured: LiveKit, auth, service token, live flights, database. Touches no upstream. |
 
-- **Send (trains/flights):** `{ "origin", "destination", "departDate": "2026-01-20", "passengers": 2 }`
-- **Send (stays):** `{ "destination", "checkIn", "checkOut", "guests": 2 }`
-- **Get:** a list of options (see `schemas.py` for exact fields).
+### Sessions — voice calls and history
 
-> These are the contract the **agent** calls too (as `search_trains` etc.). If
-> you change a field name, tell whoever owns the agent — their tool in
-> `BackPAC-Agent/src/bot/core/tools.py` sends this exact shape.
+| Method | Path | Auth | Does |
+|---|---|---|---|
+| POST | `/sessions` | user | Start (or `resumeSessionId` to resume) a call. Mints the room + token, puts the agent in it, returns `{sessionId, agentId, livekit:{url,token,roomName}, isResuming, previousMessages}`. Rate limited per user. |
+| GET | `/sessions?limit&offset&status&saved&favourite&groupId&mode` | user | History, newest first. `{sessions:[…], hasMore}`. Filters combine. `status`: `active` (planning), `completed`, `archived`; `mode`: `train\|flight\|stay`. |
+| GET | `/sessions/{id}` | user | One conversation with `messages` and `tripResults`. |
+| PATCH | `/sessions/{id}` | user | `{title?, status?: active\|completed\|archived, saved?, favourite?, groupId?}`. `groupId: null` takes it out of its group; leaving it out leaves the group alone. |
+| POST | `/sessions/{id}/end` | user | Hang up: sets `endedAt` and stops the agent's bot now. Idempotent. |
+| DELETE | `/sessions/{id}` | user | Erase one conversation (transcript and cards cascade). 204. |
+| DELETE | `/sessions` | user | Erase everything this user has, saved trips included. 204. |
+| POST | `/sessions/internal/messages` | service | Agent appends a turn. 202. |
+| POST | `/sessions/internal/title` | service | Agent names the conversation. 202. |
+| POST | `/sessions/internal/trip-results` | service | Agent records a card it showed. 202. |
+| POST | `/sessions/internal/end` | service | Agent reports the call ended. 202. |
+
+`POST /sessions` returns **402** when a free account has used this month's
+`FREE_MONTHLY_TRIP_PLANS`. Resuming an existing conversation never counts.
+
+### Groups — the user's folders ("Mountains", "Desert")
+
+| Method | Path | Auth | Does |
+|---|---|---|---|
+| GET | `/groups` | user | `[{id, name, count, createdAt}]`, oldest first. |
+| POST | `/groups` | user | `{name}` (≤40, unique per user, case-insensitive). 201. Max 50. |
+| PATCH | `/groups/{id}` | user | `{name}` — rename. |
+| DELETE | `/groups/{id}` | user | Its conversations stay, ungrouped. 204. |
+
+### Account and profile
+
+| Method | Path | Auth | Does |
+|---|---|---|---|
+| GET | `/me` | user | The profile screen in one call: `{profile:{displayName, homeCity, bio, avatar}, stats:{trips, places, saved, favourites, completed, inProgress, bucketList}, plan:{…}}`. Every count is from real rows; "places" is distinct destinations the agent searched. |
+| PATCH | `/me` | user | `{displayName?, homeCity?, bio?, avatar?}`. Only what is sent changes; `""` clears. |
+| DELETE | `/account` | user | Erase conversations, groups, saved trips, profile and plan, then close the Supabase sign-in account. `{dataErased, accountDeleted}`. Required by both app stores. |
+
+### Premium (RevenueCat)
+
+| Method | Path | Auth | Does |
+|---|---|---|---|
+| GET | `/billing/plan` | user | `{billingEnabled, premium, premiumUntil, willRenew, productId, freeMonthlyLimit, usedThisMonth, remainingThisMonth}`. |
+| POST | `/billing/sync` | user | Ask RevenueCat now (after a purchase or restore) and return the plan. |
+| POST | `/billing/revenuecat` | RevenueCat webhook `Authorization` | Keeps our copy current. Always 200 once authenticated. |
+
+### Trips — search
+
+| Method | Path | Auth | Does |
+|---|---|---|---|
+| POST | `/trips/search/trains` | service or user | **Sample data** today. `{origin, destination, departDate, passengers}` |
+| POST | `/trips/search/flights` | service or user | Live Travelpayouts prices (approximate) when configured. |
+| POST | `/trips/search/stays` | service or user | **Sample data** today. `{destination, checkIn, checkOut, guests}` |
+
+> These are the contract the **agent** calls too. If you change a field name,
+> change `BackPAC-Agent/src/bot/core/tools.py` in the same release.
+
+### Trips — saved
+
+| Method | Path | Auth | Does |
+|---|---|---|---|
+| POST | `/trips/saved` | user | `{title, destination, nights}`. Owner is the token's user. 201. |
+| GET | `/trips/saved` | user | The caller's saved trips, newest first. |
+| DELETE | `/trips/saved/{id}` | user | Remove one. 204. |
+| GET | `/trips/saved/{user_ref}` | user | Deprecated; only ever returns the caller's own. |
 
 ### Voice — what the orb says
 
-Three routes, all proxies: the agent synthesises, because that is where the
-ElevenLabs key lives, and these exist so the app still only ever talks to one
-host. **None of them is a call** — no LiveKit room, no session, no microphone
-permission. The welcome screen should not need any of that to say hello.
+Public (the welcome screen plays before sign-in), rate limited per IP. The
+agent speaks **only its own fixed lines**: any other `text` is a 404, so this
+cannot be used as a free text-to-speech API on our ElevenLabs bill.
 
-| Method | Path | Does |
-|---|---|---|
-| GET | `/api/v1/voice/greeting` (optional `?text=`) | One opening line. |
-| GET | `/api/v1/voice/welcome-lines` | Every line the orb might say: the opener, what it says when poked, what it says when you leave it alone. |
-| GET | `/api/v1/voice/line.wav?text=…` | The audio for one line. |
-
-The JSON carries `{ "text", "levels": [0..1], "frameMs": 50 }` — `levels` is one
-loudness value per frame, so the app drives the orb's mouth from the actual
-waveform rather than a generic wobble. A few hundred bytes, so it travels
-inline.
-
-**The audio does not travel inline.** Base64 in the JSON made
-`welcome-lines` a 2.5 MB body that no cache could reuse; as separate files it
-is 5.7 KB of JSON plus ~65 KB per line, fetched once and then served from the
-browser's cache (the responses are `immutable` — the text fully determines the
-audio).
-
-Every line is cached agent-side, so a cold `welcome-lines` costs one synthesis
-per line (~5s for all nineteen, done in parallel) and every request after that
-is ~20ms. The app fetches it in the background, so neither case is on screen.
-
-### Trips — saved (the database example)
-
-These two exist to show the full router→service→repository→DB path end to end.
-Read them when you build any DB-backed feature.
-
-| Method | Path | Does |
-|---|---|---|
-| POST | `/api/v1/trips/saved` | Save a trip for a user. Writes a row. |
-| GET | `/api/v1/trips/saved/{user_ref}` | List that user's saved trips, newest first. |
+| Method | Path | Auth | Does |
+|---|---|---|---|
+| GET | `/voice/greeting` (optional `?text=`) | public | One opening line: `{text, levels, frameMs}`. |
+| GET | `/voice/welcome-lines` | public | `{greeting:[…], poke:[…], idle:[…]}`. |
+| GET | `/voice/line.wav?text=…` | public | The audio for one of those lines. Immutable, cacheable. |
 
 ---
 
-## The three jobs waiting for you, in order
+## What is still sample data
 
-1. **Real search providers.** Replace the three mock methods in
-   `trips/service.py`. This is the actual product — an agent that can't really
-   search is a demo. Everything else already works around it.
-2. **Migrations.** Tables are created at startup with
-   `Base.metadata.create_all` (`db/session.py`). That is fine while the schema
-   is disposable, but it cannot *change* a table that already exists. Move to
-   Alembic before this database holds anything anyone would miss.
-3. **Auth.** Every endpoint is open right now. When you add login, sessions and
-   saved-trips should require it. `user_ref` becomes the logged-in user.
+Trains and stays return fixed sample results (`trips/service.py`). Flights are
+live when `TRAVELPAYOUTS_TOKEN` is set. Swapping in a provider is a change to
+that one file behind the existing schema.
 
 ## Two rules that will save you
 

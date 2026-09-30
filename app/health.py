@@ -26,14 +26,23 @@ async def healthz() -> dict:
 @router.get("/readyz")
 async def readyz() -> dict:
     settings = get_settings()
-    return {
+    body = {
         "status": "ok",
         "service": settings.service_name,
         "environment": settings.environment,
         # False => POST /sessions returns 503. Fill LIVEKIT_* in .env.
         "livekit_configured": settings.livekit_configured,
-        # False => only the saved-trip routes fail (503). Voice and search are
-        # unaffected; they touch no tables.
+        # False => every signed-in route returns 503. Set SUPABASE_PROJECT_REF.
+        "auth_configured": settings.auth_configured,
+        # False => the agent cannot log transcripts or search. Set SERVICE_TOKEN.
+        "service_token_configured": bool(settings.service_token),
+        # False => sample flights, clearly labelled. Set TRAVELPAYOUTS_TOKEN.
+        "flights_live": settings.flights_live,
+        # False => history and saved trips return 503 until it is reachable;
+        # the next request that needs it retries the connection.
         "database_ready": is_db_ready(),
-        "agent_base_url": settings.agent_base_url,
     }
+    # An internal address is a map for an attacker; only show it off-prod.
+    if not settings.is_production:
+        body["agent_base_url"] = settings.agent_base_url
+    return body

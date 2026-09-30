@@ -24,6 +24,16 @@ class AgentClient:
         self._http = http
         self._settings = settings
 
+    @property
+    def _headers(self) -> dict[str, str]:
+        """The shared secret, so the agent can refuse anyone who is not us.
+
+        `/start` puts a billable bot in a room; an agent reachable from the
+        internet without this check is an open tap on three paid APIs.
+        """
+        token = self._settings.service_token
+        return {"X-Service-Token": token} if token else {}
+
     async def start(
         self,
         *,
@@ -52,7 +62,10 @@ class AgentClient:
         }
         try:
             resp = await self._http.post(
-                url, json=payload, timeout=self._settings.agent_timeout_seconds
+                url,
+                json=payload,
+                headers=self._headers,
+                timeout=self._settings.agent_timeout_seconds,
             )
             resp.raise_for_status()
         except httpx.HTTPError as exc:
@@ -60,3 +73,23 @@ class AgentClient:
             raise UpstreamError(
                 "Could not start the voice agent. Is BackPAC-Agent running?"
             ) from exc
+
+    async def stop(self, *, session_id: str) -> bool:
+        """Ask the agent to end one running bot. Best effort; never raises.
+
+        Used when the app hangs up. The agent also notices the caller leaving
+        the room on its own, so a failure here costs at most the time until
+        it does — not worth failing the user's hang-up over.
+        """
+        try:
+            resp = await self._http.post(
+                f"{self._settings.agent_base_url}/stop",
+                json={"sessionId": session_id},
+                headers=self._headers,
+                timeout=5.0,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("agent /stop failed for %s: %s", session_id, exc)
+            return False
+        # 404 means it already ended by itself, which is the outcome we wanted.
+        return resp.status_code in (200, 404)

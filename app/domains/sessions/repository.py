@@ -23,7 +23,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.domains.sessions.models import Message, Session, TripResult
+from app.domains.sessions.models import Message, Session, SessionGroup, TripResult
 
 
 class SessionRepository:
@@ -119,6 +119,28 @@ class SessionRepository:
             )
         )
 
+    async def mark_started(self, *, session_id: uuid.UUID, run_id: str) -> None:
+        """A bot is now in this conversation's room: record which, and open it.
+
+        An explicit UPDATE rather than setting attributes on the ORM object:
+        `ended_at = None` on an object that already reads None is no change to
+        the ORM and writes nothing — but the row may have been ended since we
+        read it, by the bot this call just replaced reporting its own hang-up.
+        `||` merges the run id into the JSONB rather than replacing it, so a
+        title source written meanwhile survives.
+        """
+        await self._db.execute(
+            update(Session)
+            .where(Session.id == session_id)
+            .values(
+                ended_at=None,
+                meta=Session.meta.op("||")(
+                    cast({"agent_run_id": run_id}, JSONB)
+                ),
+            )
+            .execution_options(synchronize_session=False)
+        )
+
     async def set_saved(
         self, *, session_id: uuid.UUID, user_id: uuid.UUID, saved: bool
     ) -> bool:
@@ -126,6 +148,35 @@ class SessionRepository:
             update(Session)
             .where(Session.id == session_id, Session.user_id == user_id)
             .values(saved=saved)
+        )
+        return result.rowcount > 0
+
+    async def set_favourite(
+        self, *, session_id: uuid.UUID, user_id: uuid.UUID, favourite: bool
+    ) -> bool:
+        result = await self._db.execute(
+            update(Session)
+            .where(Session.id == session_id, Session.user_id == user_id)
+            .values(favourite=favourite)
+        )
+        return result.rowcount > 0
+
+    async def set_group(
+        self,
+        *,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID,
+        group_id: uuid.UUID | None,
+    ) -> bool:
+        """File a conversation in a group, or (None) take it out of one.
+
+        The caller has already checked the group is this user's; the session
+        is scoped here as always.
+        """
+        result = await self._db.execute(
+            update(Session)
+            .where(Session.id == session_id, Session.user_id == user_id)
+            .values(group_id=group_id)
         )
         return result.rowcount > 0
 
@@ -168,7 +219,154 @@ class SessionRepository:
         result = await self._db.execute(
             delete(Session).where(Session.user_id == user_id)
         )
+        await self._db.execute(
+            delete(SessionGroup).where(SessionGroup.user_id == user_id)
+        )
         return result.rowcount
+
+    # --- groups -------------------------------------------------------------
+
+    async def list_groups(self, *, user_id: uuid.UUID) -> list[tuple[SessionGroup, int]]:
+        """This user's groups, oldest first (the order they made them), each
+        with how many non-empty conversations are in it."""
+        counts = (
+            select(Session.group_id, func.count(Session.id).label("n"))
+            .where(Session.user_id == user_id, Session.message_count > 0)
+            .group_by(Session.group_id)
+            .subquery()
+        )
+        stmt = (
+            select(SessionGroup, func.coalesce(counts.c.n, 0))
+            .outerjoin(counts, counts.c.group_id == SessionGroup.id)
+            .where(SessionGroup.user_id == user_id)
+            .order_by(SessionGroup.created_at, SessionGroup.name)
+        )
+        return [(g, int(n)) for g, n in (await self._db.execute(stmt)).all()]
+
+    async def get_group(
+        self, *, group_id: uuid.UUID, user_id: uuid.UUID
+    ) -> SessionGroup | None:
+        return (
+            await self._db.execute(
+                select(SessionGroup).where(
+                    SessionGroup.id == group_id, SessionGroup.user_id == user_id
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def find_group_by_name(
+        self, *, name: str, user_id: uuid.UUID
+    ) -> SessionGroup | None:
+        return (
+            await self._db.execute(
+                select(SessionGroup).where(
+                    SessionGroup.user_id == user_id,
+                    func.lower(SessionGroup.name) == name.lower(),
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def count_groups(self, *, user_id: uuid.UUID) -> int:
+        return int(
+            (
+                await self._db.execute(
+                    select(func.count(SessionGroup.id)).where(
+                        SessionGroup.user_id == user_id
+                    )
+                )
+            ).scalar_one()
+        )
+
+    async def create_group(self, *, user_id: uuid.UUID, name: str) -> SessionGroup:
+        row = SessionGroup(user_id=user_id, name=name)
+        self._db.add(row)
+        await self._db.flush()
+        return row
+
+    async def rename_group(
+        self, *, group_id: uuid.UUID, user_id: uuid.UUID, name: str
+    ) -> bool:
+        result = await self._db.execute(
+            update(SessionGroup)
+            .where(SessionGroup.id == group_id, SessionGroup.user_id == user_id)
+            .values(name=name)
+        )
+        return result.rowcount > 0
+
+    async def delete_group(self, *, group_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+        """The conversations stay; `ON DELETE SET NULL` takes them out of it."""
+        result = await self._db.execute(
+            delete(SessionGroup).where(
+                SessionGroup.id == group_id, SessionGroup.user_id == user_id
+            )
+        )
+        return result.rowcount > 0
+
+    # --- the profile's numbers ----------------------------------------------
+
+    async def stats_for_user(self, *, user_id: uuid.UUID) -> dict[str, int]:
+        """Everything the profile counts, in two queries.
+
+        Only conversations someone actually spoke in count — the same rule the
+        history list uses, so the numbers match what the lists show.
+
+        "Places" is the distinct destinations the agent searched, read from
+        the query each card was made from. Cards stored before the agent began
+        recording its query carry none and are not counted: an undercount that
+        heals, rather than a guess.
+        """
+        spoke = Session.message_count > 0
+        row = (
+            await self._db.execute(
+                select(
+                    func.count(Session.id).filter(spoke),
+                    func.count(Session.id).filter(spoke, Session.saved.is_(True)),
+                    func.count(Session.id).filter(spoke, Session.favourite.is_(True)),
+                    func.count(Session.id).filter(spoke, Session.status == "completed"),
+                    func.count(Session.id).filter(spoke, Session.status == "active"),
+                ).where(Session.user_id == user_id)
+            )
+        ).one()
+        destination = func.lower(
+            func.trim(TripResult.payload["query"]["destination"].astext)
+        )
+        places = (
+            await self._db.execute(
+                select(func.count(func.distinct(destination)))
+                .select_from(TripResult)
+                .join(Session, Session.id == TripResult.session_id)
+                .where(
+                    Session.user_id == user_id,
+                    TripResult.payload["query"]["destination"].astext.is_not(None),
+                    destination != "",
+                )
+            )
+        ).scalar_one()
+        trips, saved, favourites, completed, in_progress = (int(v) for v in row)
+        return {
+            "trips": trips,
+            "places": int(places),
+            "saved": saved,
+            "favourites": favourites,
+            "completed": completed,
+            "in_progress": in_progress,
+        }
+
+    async def count_plans_since(self, *, user_id: uuid.UUID, since: datetime) -> int:
+        """Conversations started since `since` that anyone spoke in — what the
+        free monthly allowance counts. Opening the mic and backing out is not a
+        trip plan and costs nothing against it."""
+        return int(
+            (
+                await self._db.execute(
+                    select(func.count(Session.id)).where(
+                        Session.user_id == user_id,
+                        Session.created_at >= since,
+                        Session.message_count > 0,
+                    )
+                )
+            ).scalar_one()
+        )
 
     # --- reads ------------------------------------------------------------
 
@@ -180,6 +378,9 @@ class SessionRepository:
         offset: int = 0,
         status: str | None = None,
         saved: bool | None = None,
+        favourite: bool | None = None,
+        group_id: uuid.UUID | None = None,
+        mode: str | None = None,
     ) -> list[Session]:
         """The history screen. Newest first, without the transcripts.
 
@@ -215,6 +416,12 @@ class SessionRepository:
             stmt = stmt.where(Session.status == status)
         if saved is not None:
             stmt = stmt.where(Session.saved == saved)
+        if favourite is not None:
+            stmt = stmt.where(Session.favourite == favourite)
+        if group_id is not None:
+            stmt = stmt.where(Session.group_id == group_id)
+        if mode is not None:
+            stmt = stmt.where(Session.mode == mode)
         return list((await self._db.execute(stmt)).scalars().all())
 
     async def count_for_user(

@@ -17,7 +17,9 @@ Two rules this module exists to enforce:
    `init_database` and `get_db_session` below.
 """
 
+import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 
 from sqlalchemy import text
@@ -34,9 +36,6 @@ logger = logging.getLogger(__name__)
 
 _settings = get_settings()
 
-# Creating the engine opens no connection — it just parses the URL and picks a
-# driver. A wrong host fails later, at first use, which is what lets the app
-# boot without a database running.
 def _connect_args() -> dict:
     """Driver options that depend on where the database actually is.
 
@@ -94,9 +93,30 @@ SessionFactory = async_sessionmaker(
 # from outside without reading logs.
 _db_ready = False
 
+#: When a database that was down at boot may next be re-checked. A request that
+#: needs the database retries the connection at most this often, so a blip
+#: during a deploy heals by itself instead of 503ing until someone restarts the
+#: container — and a database that is really gone is not hammered by every
+#: request that arrives while it is.
+_RETRY_EVERY_SECONDS = 10.0
+_next_retry_at = 0.0
+_retry_lock = asyncio.Lock()
+
 
 def is_db_ready() -> bool:
     return _db_ready
+
+
+async def _retry_if_due() -> bool:
+    global _next_retry_at
+    async with _retry_lock:
+        if _db_ready:
+            return True
+        now = time.monotonic()
+        if now < _next_retry_at:
+            return False
+        _next_retry_at = now + _RETRY_EVERY_SECONDS
+        return await init_database()
 
 
 async def init_database() -> bool:
@@ -158,7 +178,7 @@ async def get_db_session() -> AsyncIterator[AsyncSession]:
     Usage in a router:
         async def route(db: AsyncSession = Depends(get_db_session)): ...
     """
-    if not _db_ready:
+    if not _db_ready and not await _retry_if_due():
         # A clear, actionable 503 beats an asyncpg connection traceback.
         raise ConfigurationError(
             "The database is not available. Start Postgres (or set DATABASE_URL "

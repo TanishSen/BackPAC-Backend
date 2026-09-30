@@ -143,9 +143,11 @@ class TripService:
         ]
 
     # --- saved trips: the DB-backed path -------------------------------
-    async def save_trip(self, repo: TripRepository, body: SaveTripRequest):
+    async def save_trip(
+        self, repo: TripRepository, body: SaveTripRequest, *, owner: str
+    ):
         return await repo.add_saved_trip(
-            user_ref=body.user_ref,
+            user_ref=owner,
             title=body.title,
             destination=body.destination,
             nights=body.nights,
@@ -153,3 +155,8 @@ class TripService:
 
     async def list_saved_trips(self, repo: TripRepository, user_ref: str):
         return await repo.list_saved_trips(user_ref)
+
+    async def delete_saved_trip(
+        self, repo: TripRepository, *, trip_id: int, owner: str
+    ) -> bool:
+        return await repo.delete_saved_trip(trip_id=trip_id, user_ref=owner)

@@ -6,7 +6,8 @@ it has been imported. Import this one module and you have them all; add a line
 here whenever a domain gains its first table.
 """
 
+from app.domains.account import models as account_models  # noqa: F401
 from app.domains.sessions import models as sessions_models  # noqa: F401
 from app.domains.trips import models as trips_models  # noqa: F401
 
-__all__ = ["sessions_models", "trips_models"]
+__all__ = ["account_models", "sessions_models", "trips_models"]

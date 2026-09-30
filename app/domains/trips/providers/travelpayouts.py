@@ -178,7 +178,6 @@ class TravelpayoutsFlights:
             "origin": origin,
             "destination": destination,
             "currency": "inr",
-            "token": self._token,
         }
         body = await self._get("/v1/prices/calendar", params)
 
@@ -204,7 +203,14 @@ class TravelpayoutsFlights:
         if owned:
             client = httpx.AsyncClient(timeout=self._timeout)
         try:
-            resp = await client.get(url, params=params, timeout=self._timeout)
+            # The token goes in a header, not the query string: URLs end up in
+            # access logs, proxies and error messages, and headers do not.
+            resp = await client.get(
+                url,
+                params=params,
+                headers={"X-Access-Token": self._token},
+                timeout=self._timeout,
+            )
         except httpx.TimeoutException as exc:
             raise ProviderError("flight search timed out", retryable=True) from exc
         except httpx.HTTPError as exc:

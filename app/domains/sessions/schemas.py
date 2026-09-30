@@ -21,10 +21,17 @@ class SessionCreate(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    agent_id: str = Field(alias="agentId")
+    #: Bounded and plain: it is stored in a 64-character column and forwarded
+    #: to the agent, so anything longer or stranger is refused here as a 422
+    #: rather than surfacing as a database error.
+    agent_id: str = Field(
+        alias="agentId", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"
+    )
     #: A display name for the caller in the LiveKit room. Optional; defaults to
     #: a generated guest name.
-    participant_name: str | None = Field(default=None, alias="participantName")
+    participant_name: str | None = Field(
+        default=None, alias="participantName", max_length=64
+    )
     #: Carry on an earlier conversation instead of starting a fresh one. The
     #: session keeps its room name, so the agent rejoins the same LangGraph
     #: thread and picks up where it left off rather than asking again.
@@ -85,6 +92,11 @@ class SessionSummary(BaseModel):
     agent_id: str = Field(alias="agentId")
     #: Bookmarked from the chat screen. Drives the "Saved" filter.
     saved: bool = False
+    #: Hearted from the history list. Drives the "Favourites" filter.
+    favourite: bool = False
+    #: The user's folder for it, or null.
+    group_id: uuid.UUID | None = Field(default=None, alias="groupId")
+    #: 'active' (still planning), 'completed' (trip taken) or 'archived'.
     status: str
     message_count: int = Field(alias="messageCount")
     created_at: datetime = Field(alias="createdAt")
@@ -138,16 +150,42 @@ class SessionDetail(SessionSummary):
 
 
 class SessionUpdate(BaseModel):
-    """Body for `PATCH /sessions/{id}`. Both fields optional; send either."""
+    """Body for `PATCH /sessions/{id}`. Every field optional; send any.
+
+    `groupId` is the one where absent and null differ: absent leaves the
+    folder alone, `null` takes the conversation out of its folder. The service
+    reads `model_fields_set` to tell them apart.
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    title: str | None = Field(default=None, max_length=200)
-    #: 'active' or 'archived'. There is no 'deleted' — DELETE deletes.
-    status: str | None = Field(default=None, pattern="^(active|archived)$")
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    #: 'active', 'completed' or 'archived'. There is no 'deleted' — DELETE
+    #: deletes.
+    status: str | None = Field(
+        default=None, pattern="^(active|completed|archived)$"
+    )
     #: Bookmark or un-bookmark. Independent of status: a conversation can be
     #: both saved and archived.
     saved: bool | None = None
+    favourite: bool | None = None
+    group_id: uuid.UUID | None = Field(default=None, alias="groupId")
+
+
+class GroupIn(BaseModel):
+    """Body for creating or renaming a group."""
+
+    name: str = Field(min_length=1, max_length=40)
+
+
+class GroupOut(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: uuid.UUID
+    name: str
+    #: How many of the user's conversations are in it — the chip shows it.
+    count: int = 0
+    created_at: datetime = Field(alias="createdAt")
 
 
 class MessageIn(BaseModel):
@@ -162,7 +200,9 @@ class MessageIn(BaseModel):
 
     room_name: str = Field(alias="roomName", max_length=128)
     role: str = Field(pattern="^(user|agent)$")
-    content: str = Field(min_length=1)
+    #: Capped well above any spoken turn, so a runaway loop upstream cannot
+    #: write megabytes into one row.
+    content: str = Field(min_length=1, max_length=20_000)
     meta: dict = Field(default_factory=dict)
 
 
@@ -188,6 +228,17 @@ class TitleIn(BaseModel):
 
     room_name: str = Field(alias="roomName", max_length=128)
     title: str = Field(min_length=1, max_length=80)
+
+
+class EndIn(BaseModel):
+    """Body for the internal route the agent reports a finished call on."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    room_name: str = Field(alias="roomName", max_length=128)
+    #: The bot reporting. A resume replaces the bot in a room, and the old
+    #: one's report can land after the new call started; it is ignored.
+    run_id: str | None = Field(default=None, alias="runId", max_length=64)
 
 
 # SessionEnvelope refers to MessageOut, which is defined below it — resolve the
