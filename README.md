@@ -12,3 +12,9 @@ in it) and **serve the trip domain** (search trains/flights/stays, saved trips).
   → `uvicorn app.main:app --reload --port 8000` → open `/docs`.
 
 This service never calls Claude or ElevenLabs — those keys live in BackPAC-Agent.
+
+---
+
+Part of **backPAC**, a voice travel planner — start at
+[BackPAC-Fe](https://github.com/TanishSen/BackPAC-Fe) for the overview and how the
+three repositories fit together. MIT licensed; see [LICENSE](LICENSE).

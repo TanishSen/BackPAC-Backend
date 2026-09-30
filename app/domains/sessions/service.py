@@ -72,6 +72,11 @@ class SessionService:
 
         Commits only once the agent is in the room — see the module docstring.
         """
+        # Imported here: billing reads this domain's repository, and a
+        # module-level import would make the two import each other.
+        from app.domains.billing.service import PlanService
+
+        plans = PlanService(self._db, self._settings, self._http)
         previous: list[MessageOut] = []
 
         if body.resume_session_id is not None:
@@ -93,13 +98,7 @@ class SessionService:
         else:
             is_resuming = False
             # A new plan is what the free allowance counts; resuming never is.
-            # Imported here: billing reads this domain's repository, and a
-            # module-level import would make the two import each other.
-            from app.domains.billing.service import PlanService
-
-            await PlanService(self._db, self._settings, self._http).assert_can_start(
-                user_id
-            )
+            await plans.assert_can_start(user_id)
             room_name = f"backpac-{uuid.uuid4().hex[:16]}"
             session = await self._repo.create(
                 user_id=user_id, room_name=room_name, agent_id=body.agent_id
@@ -130,6 +129,7 @@ class SessionService:
         #
         # What carries the conversation across calls is the room name, which is
         # also the LangGraph thread — not this.
+        premium = await plans.is_premium(user_id)
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         await self._agent.start(
             room_name=session.room_name,
@@ -137,6 +137,7 @@ class SessionService:
             agent_id=session.agent_id,
             thread_id=session.room_name,
             is_resuming=is_resuming,
+            is_premium=premium,
         )
 
         # Remembered so hanging up can stop exactly this bot (see

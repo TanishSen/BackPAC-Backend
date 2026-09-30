@@ -5,6 +5,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
@@ -12,10 +13,18 @@ from app.db.session import get_db_session
 from app.domains.billing.schemas import PlanOut
 from app.domains.billing.service import PlanService
 from app.shared.auth import current_user
+from app.shared.rate_limit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/billing", tags=["billing"])
+
+#: Ten tries in ten minutes per person: plenty for typos, useless for guessing.
+redeem_limiter = RateLimiter(limit=10, window=600, name="redeem")
+
+
+class RedeemIn(BaseModel):
+    code: str = Field(min_length=1, max_length=40)
 
 
 def _service(request: Request, db: AsyncSession, settings: Settings) -> PlanService:
@@ -43,6 +52,20 @@ async def sync_plan(
     """Called by the app right after a purchase or restore, so Premium works
     at once rather than when the webhook lands."""
     return await _service(request, db, settings).sync(user_id)
+
+
+@router.post("/redeem", response_model=PlanOut)
+async def redeem_code(
+    body: RedeemIn,
+    request: Request,
+    user_id: uuid.UUID = Depends(current_user),
+    db: AsyncSession = Depends(get_db_session),
+    settings: Settings = Depends(get_settings),
+) -> PlanOut:
+    """Unlock Premium with a promo code (PROMO_CODES). 400 if it is not valid
+    or used up; 429 after too many tries."""
+    redeem_limiter.check(f"user:{user_id}")
+    return await _service(request, db, settings).redeem(user_id, body.code)
 
 
 @router.post("/revenuecat", status_code=status.HTTP_200_OK, include_in_schema=False)

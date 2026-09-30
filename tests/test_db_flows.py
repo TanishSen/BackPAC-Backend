@@ -60,7 +60,7 @@ async def env(monkeypatch):
         await conn.execute(
             text(
                 "TRUNCATE sessions, messages, trip_results, saved_trips, "
-                "session_groups, profiles, entitlements CASCADE"
+                "session_groups, profiles, entitlements, promo_redemptions CASCADE"
             )
         )
 
@@ -506,3 +506,95 @@ async def test_account_deletion_takes_the_profile_groups_and_plan_too(env):
     for table in ("profiles", "session_groups", "entitlements"):
         n = (await _row(factory, f"SELECT count(*) AS n FROM {table} WHERE user_id=:u", u=ALICE))["n"]
         assert n == 0, table
+
+
+async def test_a_member_who_just_bought_is_not_turned_away(env):
+    # Out of free plans, and Premium bought seconds ago: neither the webhook
+    # nor the app's sync has reached us yet. The check asks RevenueCat first —
+    # here with only a public SDK key, which is enough to read.
+    c, who, agent, factory = env
+    who["settings"] = SETTINGS.model_copy(
+        update={"free_monthly_trip_plans": 1, "revenuecat_public_key": "test_public"}
+    )
+    await _talked(c)
+    route = agent.get(f"https://api.revenuecat.com/v1/subscribers/{ALICE}").mock(
+        return_value=httpx.Response(200, json={"subscriber": {"entitlements": {
+            # Named differently from ours: one tier, so any entitlement counts.
+            "pro": {"expires_date": "2099-01-01T00:00:00Z", "product_identifier": "monthly"},
+        }, "subscriptions": {}}})
+    )
+    r = await c.post("/api/v1/sessions", json={"agentId": "trip-planner"})
+    assert r.status_code == 200
+    assert route.calls.last.request.headers["Authorization"] == "Bearer test_public"
+    # ...and the agent is told this caller is Premium.
+    assert json.loads(agent.routes[0].calls.last.request.content)["isPremium"] is True
+
+
+async def test_a_free_caller_reaches_the_agent_as_free(env):
+    c, who, agent, factory = env
+    await c.post("/api/v1/sessions", json={"agentId": "trip-planner"})
+    assert json.loads(agent.routes[0].calls.last.request.content)["isPremium"] is False
+
+
+
+# --- promo codes -------------------------------------------------------------
+
+
+async def test_a_promo_code_unlocks_premium_once_per_person(env):
+    c, who, agent, factory = env
+    who["settings"] = SETTINGS.model_copy(
+        update={"free_monthly_trip_plans": 1, "promo_codes": "SHIPATON2026:30:2, BAD, X:notanumber"}
+    )
+    await _talked(c)
+    assert (await c.post("/api/v1/sessions", json={"agentId": "trip-planner"})).status_code == 402
+
+    bad = await c.post("/api/v1/billing/redeem", json={"code": "nope"})
+    assert bad.status_code == 400 and "isn't valid" in bad.json()["error"]
+
+    # Case and spaces do not matter.
+    r = await c.post("/api/v1/billing/redeem", json={"code": "  shipaton2026 "})
+    assert r.status_code == 200
+    plan = r.json()
+    assert plan["premium"] and plan["productId"] == "promo" and not plan["willRenew"]
+    until = plan["premiumUntil"]
+
+    # Premium lifts the allowance, and the agent hears it.
+    assert (await c.post("/api/v1/sessions", json={"agentId": "trip-planner"})).status_code == 200
+    assert json.loads(agent.routes[0].calls.last.request.content)["isPremium"] is True
+
+    # Again: harmless, and does not add another 30 days.
+    again = await c.post("/api/v1/billing/redeem", json={"code": "SHIPATON2026"})
+    assert again.status_code == 200 and again.json()["premiumUntil"] == until
+
+
+async def test_a_code_stops_at_its_limit(env):
+    c, who, agent, factory = env
+    who["settings"] = SETTINGS.model_copy(update={"promo_codes": "JUDGES:7:1"})
+    assert (await c.post("/api/v1/billing/redeem", json={"code": "JUDGES"})).status_code == 200
+    who["user"] = BOB
+    r = await c.post("/api/v1/billing/redeem", json={"code": "JUDGES"})
+    assert r.status_code == 400 and "fully redeemed" in r.json()["error"]
+
+
+async def test_a_revenuecat_refresh_does_not_cancel_a_promo(env):
+    # The refresh writes RevenueCat's answer (no subscription) — which must
+    # not wipe Premium that came from a code.
+    c, who, agent, factory = env
+    who["settings"] = SETTINGS.model_copy(
+        update={"promo_codes": "SHIPATON2026:30", "revenuecat_public_key": "test_public"}
+    )
+    await c.post("/api/v1/billing/redeem", json={"code": "SHIPATON2026"})
+    agent.get(f"https://api.revenuecat.com/v1/subscribers/{ALICE}").mock(
+        return_value=httpx.Response(200, json={"subscriber": {"entitlements": {}}})
+    )
+    plan = (await c.post("/api/v1/billing/sync")).json()
+    assert plan["premium"] is True
+
+
+async def test_account_deletion_forgets_redemptions(env):
+    c, who, agent, factory = env
+    who["settings"] = SETTINGS.model_copy(update={"promo_codes": "SHIPATON2026:30"})
+    await c.post("/api/v1/billing/redeem", json={"code": "SHIPATON2026"})
+    assert (await c.delete("/api/v1/account")).status_code == 200
+    n = (await _row(factory, "SELECT count(*) AS n FROM promo_redemptions WHERE user_id=:u", u=ALICE))["n"]
+    assert n == 0

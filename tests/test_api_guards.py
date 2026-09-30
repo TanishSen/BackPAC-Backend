@@ -274,3 +274,12 @@ async def test_a_supabase_failure_is_reported_not_hidden(client, signed_in):
     assert r.status_code == 502
     # The data half still happened, so a retry is safe.
     assert signed_in
+
+
+@pytest.mark.parametrize("page", ["/legal/privacy", "/legal/terms"])
+async def test_the_legal_pages_are_public_html(client, page):
+    # The stores link here, so no sign-in and a real HTML page.
+    r = await client.get(page)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    assert "mailto:" in r.text

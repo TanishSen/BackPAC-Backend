@@ -42,6 +42,7 @@ class AgentClient:
         agent_id: str,
         thread_id: str,
         is_resuming: bool = False,
+        is_premium: bool = False,
     ) -> None:
         """Ask the agent to join `room_name`. Raises UpstreamError if the agent
         is down or refuses — the caller turns that into a 502 so the app knows
@@ -59,6 +60,9 @@ class AgentClient:
             # thread has either way. It uses this to decide whether to open
             # with a greeting or pick up mid-conversation.
             "isResuming": is_resuming,
+            # Premium members get the Premium planner (insider tips). Decided
+            # here, from our copy of RevenueCat's answer — never by the app.
+            "isPremium": is_premium,
         }
         try:
             resp = await self._http.post(

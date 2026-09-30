@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String, func
+from sqlalchemy import Boolean, DateTime, PrimaryKeyConstraint, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -62,6 +62,27 @@ class Entitlement(Base):
     will_renew: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false"
     )
+    #: Premium from a promo code, until this moment. Kept apart from
+    #: `premium_until` on purpose: that column is RevenueCat's answer and is
+    #: overwritten by every refresh, which would silently cancel the code.
+    promo_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class PromoRedemption(Base):
+    """One person redeeming one promo code — at most once each, and counted
+    against the code's limit."""
+
+    __tablename__ = "promo_redemptions"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    code: Mapped[str] = mapped_column(String(40))
+    redeemed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (PrimaryKeyConstraint("user_id", "code"),)

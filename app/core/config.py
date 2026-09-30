@@ -119,6 +119,41 @@ class Settings(BaseSettings):
     #   directly after a purchase and whenever a webhook arrives.
     revenuecat_webhook_auth: str = ""
     revenuecat_secret_key: str = ""
+    #: A public SDK key (goog_…, appl_…, or a Test Store test_…). Enough to
+    #: *read* a customer's entitlements — which is all the refresh needs — so a
+    #: deployment without a secret key still verifies purchases server-side.
+    #: The secret key is preferred when both are set, and is still needed to
+    #: delete a customer on account deletion.
+    revenuecat_public_key: str = ""
+
+    @property
+    def revenuecat_read_key(self) -> str:
+        return self.revenuecat_secret_key or self.revenuecat_public_key
+
+    #: Promo codes that unlock Premium, e.g. for hackathon judges or press:
+    #: `CODE:DAYS[:MAX_USES]`, comma-separated — "SHIPATON2026:30:500".
+    #: Case-insensitive; each person can redeem a code once. Empty = none.
+    promo_codes: str = ""
+
+    @property
+    def promo_code_table(self) -> dict[str, tuple[int, int | None]]:
+        """CODE -> (days, max uses or None). Malformed entries are skipped."""
+        table: dict[str, tuple[int, int | None]] = {}
+        for entry in self.promo_codes.split(","):
+            parts = [p.strip() for p in entry.split(":")]
+            if len(parts) < 2 or not parts[0]:
+                continue
+            try:
+                days = int(parts[1])
+                uses = int(parts[2]) if len(parts) > 2 and parts[2] else None
+            except ValueError:
+                continue
+            if days > 0:
+                table[parts[0].upper()] = (days, uses)
+        return table
+
+    #: Where users write for help. Premium members' mail is flagged priority.
+    support_email: str = "contact@tanishsen.com"
     #: The entitlement identifier configured in RevenueCat.
     premium_entitlement_id: str = "premium"
     #: New trip plans a free account may start per calendar month (UTC).

@@ -46,7 +46,10 @@ for every endpoint below. That is the fastest way to see and test them.
 | `REVENUECAT_WEBHOOK_AUTH` | the Authorization value RevenueCat's webhook sends. | webhook 503; Premium still syncs via `REVENUECAT_SECRET_KEY` |
 | `REVENUECAT_SECRET_KEY` | v1 secret key: ask RevenueCat directly after a purchase. | webhook events applied as sent |
 | `PREMIUM_ENTITLEMENT_ID` | the RevenueCat entitlement (default `premium`). | — |
-| `FREE_MONTHLY_TRIP_PLANS` | new plans per month on the free plan. **0 = unlimited, no upgrade prompts.** | — |
+| `FREE_MONTHLY_TRIP_PLANS` | new plans per month on the free plan. **0 = unlimited.** | — |
+| `REVENUECAT_PUBLIC_KEY` | a public SDK key (incl. Test Store `test_`): enough to verify purchases server-side. | needs the secret key instead |
+| `PROMO_CODES` | `CODE:DAYS[:MAX_USES],…` promo codes that unlock Premium. | redeem always 400 |
+| `SUPPORT_EMAIL` | support address (priority-flagged for Premium). | contact@tanishsen.com |
 | `DOCS_ENABLED` | serve `/docs`. | — |
 | `SESSION_START_LIMIT` / `_WINDOW_SECONDS` | calls a user may start per window (default 10 / 600s). | — |
 | `SEARCH_LIMIT` / `_WINDOW_SECONDS` | searches per signed-in user (default 30 / 60s). The agent is exempt. | — |
@@ -71,6 +74,13 @@ validation. `429` carries `Retry-After`.
 
 **Auth column:** *user* = `Authorization: Bearer <Supabase access token>`;
 *service* = `X-Service-Token: <SERVICE_TOKEN>` (the agent); *public* = none.
+
+### Legal (public HTML)
+
+| Method | Path | Does |
+|---|---|---|
+| GET | `/legal/privacy` | Privacy policy — the URL for the store listings and the paywall. |
+| GET | `/legal/terms` | Terms of use, including subscription terms. |
 
 ### Health
 
@@ -121,6 +131,7 @@ validation. `429` carries `Retry-After`.
 |---|---|---|---|
 | GET | `/billing/plan` | user | `{billingEnabled, premium, premiumUntil, willRenew, productId, freeMonthlyLimit, usedThisMonth, remainingThisMonth}`. |
 | POST | `/billing/sync` | user | Ask RevenueCat now (after a purchase or restore) and return the plan. |
+| POST | `/billing/redeem` | user | `{code}` — unlock Premium with a `PROMO_CODES` code. Once per person; 400 if invalid or used up; 10 tries / 10 min. |
 | POST | `/billing/revenuecat` | RevenueCat webhook `Authorization` | Keeps our copy current. Always 200 once authenticated. |
 
 ### Trips — search
